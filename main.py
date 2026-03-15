@@ -138,9 +138,18 @@ def _looks_like_invoice_data(invoice_data: InvoiceData) -> bool:
     has_vendor = _valid_tax_id((invoice_data.vendor_tax_id or "").strip())
     has_buyer = _valid_tax_id((invoice_data.buyer_tax_id or "").strip())
     has_date = bool((invoice_data.date or "").strip()) and invoice_data.date != "1970-01-01"
-    signal_count = sum([has_amount, has_items, has_vendor, has_buyer, has_date])
-    # Require at least two concrete signals so a default invoice_type alone is not enough.
-    return signal_count >= 2
+    invoice_type = (invoice_data.invoice_type or "").strip()
+    is_supported_type = invoice_type in {"發票", "收據", "空白收據"}
+
+    if not is_supported_type:
+        return False
+
+    # Blank receipts usually do not have tax IDs, but should still have basic structure.
+    if invoice_type == "空白收據":
+        return has_amount and has_date and has_items
+
+    # Normal invoices/receipts must contain core structured fields.
+    return has_amount and has_date and has_items
 
 
 def _eligibility_text(eligibility: int) -> str:
@@ -383,7 +392,7 @@ def handle_image_message(event: MessageEvent):
         if not _looks_like_invoice_data(invoice_data):
             line_service.push_text(
                 user_id,
-                "目前在圖片中沒有辨識到發票或收據的關鍵資訊，請重新拍攝清晰的票據後再上傳。",
+                "非發票相關內容 無法使用",
             )
             return
 
