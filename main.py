@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent, FollowEvent
+import re
 
 from config import config
 from services.sheets_service import SheetsService
@@ -28,6 +29,9 @@ SKIP_TOKENS = {"略過", "跳過", "skip"}
 BOOKKEEP_TOKENS = {"記帳", "記賬", "手動記帳", "manual"}
 ACTIVATION_TOKEN = "好"
 USAGE_GUIDE_TOKENS = {"如何使用"}
+AMOUNT_ALERT_THRESHOLD = 50000
+AMOUNT_CONFIRM_ACCEPT_TOKENS = {"確認改金額", "改成這個金額", "是"}
+AMOUNT_CONFIRM_REJECT_TOKENS = {"不要改金額", "先不要改", "否"}
 
 # Global service instances
 _sheets_service = None
@@ -122,7 +126,7 @@ def handle_any_message_sync(event: MessageEvent):
         if state_manager.user_exists(user_id):
             state_manager.touch_user(user_id, display_name)
         else:
-            line_service.reply_text(event.reply_token, _activation_guide_text(display_name))
+            _reply_activation_guide(line_service, event.reply_token, display_name)
     except Exception:
         import traceback
 
@@ -237,7 +241,8 @@ def _activation_guide_text(display_name: str) -> str:
         "1) 傳「記帳」開始手動記帳\n"
         "2) 或直接上傳發票/收據照片\n"
         "3) 依提示「確認 / 修改 / 取消」\n\n"
-        "請先回覆一個「好」完成啟用。"
+        "請先回覆一個「好」完成啟用。\n"
+        "備註：若忘記如何使用，可隨時輸入「如何使用」。"
     )
 
 
@@ -248,6 +253,199 @@ def _is_activation_token(text: str) -> bool:
 def _is_usage_guide_token(text: str) -> bool:
     raw = (text or "").strip()
     return raw in USAGE_GUIDE_TOKENS
+
+
+def _reply_activation_guide(line_service: LineService, reply_token: str, display_name: str):
+    line_service.reply_flex(
+        reply_token,
+        "歡迎使用",
+        _build_activation_guide_flex(display_name),
+    )
+
+
+def _build_activation_guide_flex(display_name: str) -> dict:
+    name = (display_name or "").strip() or "同學"
+    return {
+        "type": "bubble",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": f"{name} 歡迎使用",
+                    "weight": "bold",
+                    "size": "lg",
+                    "wrap": True,
+                },
+                {
+                    "type": "text",
+                    "text": "使用方式：\n1) 傳「記帳」開始手動記帳\n2) 或直接上傳發票/收據照片\n3) 依提示「確認 / 修改 / 取消」",
+                    "size": "sm",
+                    "color": "#555555",
+                    "wrap": True,
+                    "margin": "md",
+                },
+                {
+                    "type": "text",
+                    "text": "備註：忘記如何使用，可直接輸入「如何使用」。",
+                    "size": "sm",
+                    "color": "#777777",
+                    "wrap": True,
+                    "margin": "md",
+                },
+            ],
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "height": "sm",
+                    "action": {
+                        "type": "message",
+                        "label": "好，開始使用",
+                        "text": "好",
+                    },
+                },
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "sm",
+                    "action": {
+                        "type": "message",
+                        "label": "如何使用",
+                        "text": "如何使用",
+                    },
+                },
+            ],
+            "flex": 0,
+        },
+    }
+
+
+def _to_amount(value) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _strip_pending_amount_meta(data: dict) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if not str(k).startswith("_pending_")}
+
+
+def _is_amount_confirm_pending(data: dict) -> bool:
+    return isinstance(data, dict) and data.get("_pending_amount_confirm") is True
+
+
+def _should_confirm_amount_change(raw_text: str, old_amount: int, new_amount: int) -> bool:
+    text = (raw_text or "").strip()
+    is_numeric_only = bool(re.fullmatch(r"\d+", text))
+    is_changed = int(new_amount) != int(old_amount)
+    is_large = int(new_amount) > AMOUNT_ALERT_THRESHOLD
+    return is_changed and (is_numeric_only or is_large)
+
+
+def _build_amount_confirm_flex(old_amount: int, new_amount: int) -> dict:
+    warning = ""
+    if new_amount > AMOUNT_ALERT_THRESHOLD:
+        warning = f"提醒：超過 {AMOUNT_ALERT_THRESHOLD} 屬於大金額，請再次確認。"
+
+    contents = [
+        {
+            "type": "text",
+            "text": "金額修改確認",
+            "weight": "bold",
+            "size": "lg",
+        },
+        {
+            "type": "text",
+            "text": f"原金額：${old_amount}\n新金額：${new_amount}",
+            "margin": "md",
+            "wrap": True,
+        },
+        {
+            "type": "text",
+            "text": "是否要將金額改成這個數字？",
+            "size": "sm",
+            "color": "#555555",
+            "margin": "md",
+            "wrap": True,
+        },
+    ]
+    if warning:
+        contents.append(
+            {
+                "type": "text",
+                "text": warning,
+                "size": "sm",
+                "color": "#B00020",
+                "margin": "md",
+                "wrap": True,
+            }
+        )
+
+    return {
+        "type": "bubble",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": contents,
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "height": "sm",
+                    "action": {
+                        "type": "message",
+                        "label": "確認改金額",
+                        "text": "確認改金額",
+                    },
+                },
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "sm",
+                    "action": {
+                        "type": "message",
+                        "label": "先不要改",
+                        "text": "不要改金額",
+                    },
+                },
+            ],
+            "flex": 0,
+        },
+    }
+
+
+def _make_pending_amount_payload(base_data: dict, candidate_data: dict, old_amount: int, new_amount: int) -> dict:
+    return {
+        **_strip_pending_amount_meta(base_data),
+        "_pending_amount_confirm": True,
+        "_pending_old_amount": int(old_amount),
+        "_pending_new_amount": int(new_amount),
+        "_pending_base_data": _strip_pending_amount_meta(base_data),
+        "_pending_candidate_data": _strip_pending_amount_meta(candidate_data),
+    }
+
+
+def _is_amount_confirm_accept(text: str) -> bool:
+    return (text or "").strip() in AMOUNT_CONFIRM_ACCEPT_TOKENS
+
+
+def _is_amount_confirm_reject(text: str) -> bool:
+    return (text or "").strip() in AMOUNT_CONFIRM_REJECT_TOKENS
 
 
 def handle_follow_event(event: FollowEvent):
@@ -264,12 +462,12 @@ def handle_follow_event(event: FollowEvent):
     if state_manager.user_exists(user_id):
         state_manager.touch_user(user_id, display_name)
 
-    line_service.reply_text(reply_token, _activation_guide_text(display_name))
+    _reply_activation_guide(line_service, reply_token, display_name)
 
 
 def _apply_edit_and_reply(user_id: str, reply_token: str, text: str):
     _, line_service, state_manager = get_services()
-    temp_data = state_manager.get_temp_data(user_id)
+    temp_data = _strip_pending_amount_meta(state_manager.get_temp_data(user_id))
     if not temp_data:
         line_service.reply_text(reply_token, "目前沒有可修改資料，請先上傳一張發票圖片。")
         return
@@ -278,6 +476,18 @@ def _apply_edit_and_reply(user_id: str, reply_token: str, text: str):
     updated_invoice = apply_user_edit(temp_data, text, trace_id=trace_id)
     merged_data = _preserve_meta_fields(temp_data, updated_invoice)
 
+    old_amount = _to_amount(temp_data.get("amount"))
+    new_amount = _to_amount(merged_data.get("amount"))
+    if _should_confirm_amount_change(text, old_amount, new_amount):
+        pending_payload = _make_pending_amount_payload(temp_data, merged_data, old_amount, new_amount)
+        state_manager.set_state(user_id, AppState.WAITING_FOR_INFO, pending_payload)
+        line_service.reply_flex(
+            reply_token,
+            "請確認是否修改金額",
+            _build_amount_confirm_flex(old_amount, new_amount),
+        )
+        return
+
     state_manager.set_state(user_id, AppState.WAITING_FOR_CONFIRM, merged_data)
     flex_message = line_service.build_confirmation_flex(merged_data)
     line_service.reply_flex(reply_token, "已更新內容，請再次確認", flex_message)
@@ -285,13 +495,25 @@ def _apply_edit_and_reply(user_id: str, reply_token: str, text: str):
 
 def _apply_manual_parse_and_reply(user_id: str, reply_token: str, text: str):
     _, line_service, state_manager = get_services()
-    temp_data = state_manager.get_temp_data(user_id)
+    temp_data = _strip_pending_amount_meta(state_manager.get_temp_data(user_id))
     if not _is_manual_mode(temp_data):
         temp_data = _default_manual_record()
 
     trace_id = f"{user_id}:{reply_token}"
     parsed = parse_manual_record_text(text, temp_data, trace_id=trace_id)
     parsed["_mode"] = "manual_bookkeeping"
+
+    old_amount = _to_amount(temp_data.get("amount"))
+    new_amount = _to_amount(parsed.get("amount"))
+    if _should_confirm_amount_change(text, old_amount, new_amount):
+        pending_payload = _make_pending_amount_payload(temp_data, parsed, old_amount, new_amount)
+        state_manager.set_state(user_id, AppState.WAITING_FOR_INFO, pending_payload)
+        line_service.reply_flex(
+            reply_token,
+            "請確認是否修改金額",
+            _build_amount_confirm_flex(old_amount, new_amount),
+        )
+        return
 
     changed = []
     for k in ["date", "receipt_type", "item_name", "category", "amount"]:
@@ -327,15 +549,15 @@ def handle_text_message(event: MessageEvent):
                 "已完成啟用。你可以傳「記帳」開始手動記帳，或直接上傳發票圖片。",
             )
         elif _is_usage_guide_token(text):
-            line_service.reply_text(reply_token, _activation_guide_text(display_name))
+            _reply_activation_guide(line_service, reply_token, display_name)
         else:
-            line_service.reply_text(reply_token, _activation_guide_text(display_name))
+            _reply_activation_guide(line_service, reply_token, display_name)
         return
 
     state_manager.touch_user(user_id, display_name)
 
     if _is_usage_guide_token(text):
-        line_service.reply_text(reply_token, _activation_guide_text(display_name))
+        _reply_activation_guide(line_service, reply_token, display_name)
         return
 
     # cancel works globally
@@ -359,6 +581,39 @@ def handle_text_message(event: MessageEvent):
         return
 
     state = state_manager.get_state(user_id)
+    temp_data = state_manager.get_temp_data(user_id)
+
+    if _is_amount_confirm_pending(temp_data):
+        old_amount = _to_amount(temp_data.get("_pending_old_amount"))
+        new_amount = _to_amount(temp_data.get("_pending_new_amount"))
+
+        if _is_amount_confirm_accept(text):
+            candidate_data = _strip_pending_amount_meta(temp_data.get("_pending_candidate_data") or {})
+            if not candidate_data:
+                candidate_data = _strip_pending_amount_meta(temp_data)
+            state_manager.set_state(user_id, AppState.WAITING_FOR_CONFIRM, candidate_data)
+            if _is_manual_mode(candidate_data):
+                flex = line_service.build_manual_record_flex(candidate_data)
+            else:
+                flex = line_service.build_confirmation_flex(candidate_data)
+            line_service.reply_flex(reply_token, "金額已更新，請確認資料", flex)
+            return
+
+        if _is_amount_confirm_reject(text):
+            base_data = _strip_pending_amount_meta(temp_data.get("_pending_base_data") or {})
+            if base_data:
+                state_manager.set_state(user_id, AppState.WAITING_FOR_INFO, base_data)
+            else:
+                state_manager.clear_state(user_id)
+            line_service.reply_text(reply_token, "已取消本次金額修改，請繼續輸入你要修改的內容。")
+            return
+
+        line_service.reply_flex(
+            reply_token,
+            "請先確認金額是否要修改",
+            _build_amount_confirm_flex(old_amount, new_amount),
+        )
+        return
 
     if state.state == AppState.WAITING_FOR_CONFIRM.value:
         temp_data = state_manager.get_temp_data(user_id)
@@ -480,7 +735,7 @@ def handle_image_message(event: MessageEvent):
             display_name = "同學"
 
         if not state_manager.user_exists(user_id):
-            line_service.reply_text(reply_token, _activation_guide_text(display_name))
+            _reply_activation_guide(line_service, reply_token, display_name)
             return
 
         state_manager.touch_user(user_id, display_name)
