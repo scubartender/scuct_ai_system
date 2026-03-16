@@ -154,6 +154,9 @@ class SheetsService:
         self.log_action(action=action, details=details, token=safe_token)
 
     # --- State Management ---
+    def user_exists(self, line_id: str) -> bool:
+        return bool(self.states_sheet.find(line_id, in_column=1))
+
     def get_user_state(self, line_id: str) -> UserState:
         cell = self.states_sheet.find(line_id, in_column=1)
         if not cell:

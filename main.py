@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent, FollowEvent
 
 from config import config
 from services.sheets_service import SheetsService
@@ -26,6 +26,8 @@ EDIT_TOKENS = {"修改", "更正", "edit", "fix"}
 CANCEL_TOKENS = {"取消", "cancel", "reset"}
 SKIP_TOKENS = {"略過", "跳過", "skip"}
 BOOKKEEP_TOKENS = {"記帳", "記賬", "手動記帳", "manual"}
+ACTIVATION_TOKEN = "好"
+USAGE_GUIDE_TOKENS = {"如何使用"}
 
 # Global service instances
 _sheets_service = None
@@ -89,6 +91,17 @@ def handle_image_message_sync(event: MessageEvent):
             traceback.print_exc(file=f)
 
 
+@handler.add(FollowEvent)
+def handle_follow_event_sync(event: FollowEvent):
+    try:
+        handle_follow_event(event)
+    except Exception:
+        import traceback
+
+        with open("debug_error.log", "a", encoding="utf-8") as f:
+            traceback.print_exc(file=f)
+
+
 @handler.add(MessageEvent)
 def handle_any_message_sync(event: MessageEvent):
     if isinstance(event.message, (TextMessageContent, ImageMessageContent)):
@@ -106,7 +119,10 @@ def handle_any_message_sync(event: MessageEvent):
         except Exception:
             display_name = "Unknown"
 
-        state_manager.touch_user(user_id, display_name)
+        if state_manager.user_exists(user_id):
+            state_manager.touch_user(user_id, display_name)
+        else:
+            line_service.reply_text(event.reply_token, _activation_guide_text(display_name))
     except Exception:
         import traceback
 
@@ -213,6 +229,44 @@ def _reply_manual_edit_guide(line_service: LineService, reply_token: str):
     line_service.reply_text(reply_token, msg)
 
 
+def _activation_guide_text(display_name: str) -> str:
+    name = (display_name or "").strip() or "同學"
+    return (
+        f"{name} 你好，歡迎使用記帳機器人。\n"
+        "使用方式：\n"
+        "1) 傳「記帳」開始手動記帳\n"
+        "2) 或直接上傳發票/收據照片\n"
+        "3) 依提示「確認 / 修改 / 取消」\n\n"
+        "請先回覆一個「好」完成啟用。"
+    )
+
+
+def _is_activation_token(text: str) -> bool:
+    return (text or "").strip() == ACTIVATION_TOKEN
+
+
+def _is_usage_guide_token(text: str) -> bool:
+    raw = (text or "").strip()
+    return raw in USAGE_GUIDE_TOKENS
+
+
+def handle_follow_event(event: FollowEvent):
+    _, line_service, state_manager = get_services()
+    user_id = event.source.user_id
+    reply_token = event.reply_token
+
+    try:
+        profile = line_service.messaging_api.get_profile(user_id)
+        display_name = profile.display_name or "同學"
+    except Exception:
+        display_name = "同學"
+
+    if state_manager.user_exists(user_id):
+        state_manager.touch_user(user_id, display_name)
+
+    line_service.reply_text(reply_token, _activation_guide_text(display_name))
+
+
 def _apply_edit_and_reply(user_id: str, reply_token: str, text: str):
     _, line_service, state_manager = get_services()
     temp_data = state_manager.get_temp_data(user_id)
@@ -265,7 +319,24 @@ def handle_text_message(event: MessageEvent):
     except Exception:
         display_name = "Unknown"
 
+    if not state_manager.user_exists(user_id):
+        if _is_activation_token(text):
+            state_manager.touch_user(user_id, display_name)
+            line_service.reply_text(
+                reply_token,
+                "已完成啟用。你可以傳「記帳」開始手動記帳，或直接上傳發票圖片。",
+            )
+        elif _is_usage_guide_token(text):
+            line_service.reply_text(reply_token, _activation_guide_text(display_name))
+        else:
+            line_service.reply_text(reply_token, _activation_guide_text(display_name))
+        return
+
     state_manager.touch_user(user_id, display_name)
+
+    if _is_usage_guide_token(text):
+        line_service.reply_text(reply_token, _activation_guide_text(display_name))
+        return
 
     # cancel works globally
     if _is_token(text, CANCEL_TOKENS):
@@ -407,6 +478,10 @@ def handle_image_message(event: MessageEvent):
             display_name = profile.display_name or "同學"
         except Exception:
             display_name = "同學"
+
+        if not state_manager.user_exists(user_id):
+            line_service.reply_text(reply_token, _activation_guide_text(display_name))
+            return
 
         state_manager.touch_user(user_id, display_name)
         state_manager.clear_state(user_id, user_name=display_name)

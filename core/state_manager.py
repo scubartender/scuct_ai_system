@@ -12,6 +12,9 @@ class StateManager:
     def __init__(self, sheets_service):
         self.sheets = sheets_service
         
+    def user_exists(self, line_id: str) -> bool:
+        return self.sheets.user_exists(line_id)
+
     def get_state(self, line_id: str) -> UserState:
         """Fetch user state from Sheets"""
         return self.sheets.get_user_state(line_id)
