@@ -1,6 +1,7 @@
 ﻿import json
 import os
 import re
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -9,8 +10,6 @@ from google.oauth2.service_account import Credentials
 
 from config import config
 from core.schemas import InvoiceData, UserState
-
-SERVICE_ACCOUNT_JSON_STR = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -53,8 +52,9 @@ STATES_HEADERS_V1 = ["LINE ID", "Current State", "Temp JSON"]
 
 
 def get_gspread_client():
-    if SERVICE_ACCOUNT_JSON_STR:
-        creds_dict = json.loads(SERVICE_ACCOUNT_JSON_STR)
+    service_account_json = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
+    if service_account_json:
+        creds_dict = json.loads(service_account_json)
         credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         return gspread.authorize(credentials)
 
@@ -75,6 +75,7 @@ class SheetsService:
         self.log_sheet = self._get_or_create_sheet(["Log"], "Log")
 
         self._init_headers()
+        self._state_row_cache: dict[str, int] = {}
 
     def _normalize_sheet_title(self, title: str) -> str:
         return str(title).replace(" ", "").replace("_", "").replace("-", "").strip().lower()
@@ -191,21 +192,33 @@ class SheetsService:
         )
 
     # --- State Management ---
-    def user_exists(self, line_id: str) -> bool:
-        return bool(self.states_sheet.find(line_id, in_column=1))
+    def _find_state_row_idx(self, line_id: str) -> Optional[int]:
+        if not line_id:
+            return None
+        cached = self._state_row_cache.get(line_id)
+        if cached:
+            try:
+                cached_row = self.states_sheet.row_values(cached)
+                if cached_row and str(cached_row[0]).strip() == line_id:
+                    return cached
+            except Exception:
+                pass
+            self._state_row_cache.pop(line_id, None)
 
-    def get_user_state(self, line_id: str) -> UserState:
         cell = self.states_sheet.find(line_id, in_column=1)
         if not cell:
-            return UserState(line_id=line_id)
+            return None
 
-        row_values = self.states_sheet.row_values(cell.row)
+        self._state_row_cache[line_id] = cell.row
+        return cell.row
+
+    def _parse_user_state_row(self, row_values: list[str], line_id: str) -> UserState:
         while len(row_values) < 5:
             row_values.append("")
         header = self.states_sheet.row_values(1)
         if header[: len(STATES_HEADERS)] == STATES_HEADERS:
             return UserState(
-                line_id=row_values[0],
+                line_id=row_values[0] or line_id,
                 user_name=row_values[1] or "Unknown",
                 state=row_values[2] or "NORMAL",
                 temp_data=row_values[3] if row_values[3] else None,
@@ -214,20 +227,66 @@ class SheetsService:
 
         # Backward-compatible parsing for old 3-column layout.
         return UserState(
-            line_id=row_values[0],
+            line_id=row_values[0] or line_id,
             user_name="Unknown",
             state=row_values[1] or "NORMAL",
             temp_data=row_values[2] if row_values[2] else None,
             last_used=None,
         )
 
+    def user_exists(self, line_id: str) -> bool:
+        return self._find_state_row_idx(line_id) is not None
+
+    def get_user_state(self, line_id: str) -> UserState:
+        row_idx = self._find_state_row_idx(line_id)
+        if row_idx is None:
+            return UserState(line_id=line_id)
+
+        row_values = self.states_sheet.row_values(row_idx)
+        return self._parse_user_state_row(row_values, line_id=line_id)
+
     def set_user_state(self, state: UserState):
-        cell = self.states_sheet.find(state.line_id, in_column=1)
-        if cell:
-            row_idx = cell.row
+        row_idx = self._find_state_row_idx(state.line_id)
+        if row_idx is not None:
             self.states_sheet.update(f"A{row_idx}:E{row_idx}", [state.to_row()])
+            self._state_row_cache[state.line_id] = row_idx
         else:
             self.states_sheet.append_row(state.to_row())
+            appended = self.states_sheet.find(state.line_id, in_column=1)
+            if appended:
+                self._state_row_cache[state.line_id] = appended.row
+
+    def reset_all_states_to_normal(self, reason: str = "manual") -> dict:
+        values = self.states_sheet.get_all_values()
+        if not values or len(values) <= 1:
+            return {"updated_rows": 0, "total_rows": 0}
+
+        header = values[0]
+        is_v2_layout = header[: len(STATES_HEADERS)] == STATES_HEADERS
+        state_idx = 2 if is_v2_layout else 1
+        width = 5 if is_v2_layout else 3
+        end_col = "E" if is_v2_layout else "C"
+
+        updated_rows = []
+        changed_rows = 0
+        for row in values[1:]:
+            row_copy = list(row)
+            while len(row_copy) < width:
+                row_copy.append("")
+            if (row_copy[state_idx] or "NORMAL") != "NORMAL":
+                changed_rows += 1
+            row_copy[state_idx] = "NORMAL"
+            updated_rows.append(row_copy[:width])
+
+        end_row = len(updated_rows) + 1
+        self.states_sheet.update(f"A2:{end_col}{end_row}", updated_rows)
+        self._state_row_cache = {}
+        self.log_action(
+            "RESET_ALL_STATES",
+            f"Set all Current State to NORMAL. reason={reason};rows={len(updated_rows)};changed={changed_rows}",
+            user="SYSTEM",
+        )
+        return {"updated_rows": changed_rows, "total_rows": len(updated_rows)}
 
     # --- Eligibility Logic ---
     def _is_valid_tax_id(self, value: str) -> bool:
@@ -283,19 +342,31 @@ class SheetsService:
         return 2
 
     # --- Core Logic ---
-    def save_invoice_and_match(self, user_id: str, display_name: str, data: InvoiceData, image_url: str) -> dict:
+    def _new_invoice_id(self, prefix: str, now: datetime) -> str:
+        # Avoid collisions under concurrent requests by combining time with random suffix.
+        stamp = now.strftime("%Y%m%d%H%M%S")
+        suffix = uuid.uuid4().hex[:6].upper()
+        return f"{prefix}-{stamp}-{suffix}"
+
+    def save_invoice_and_match(
+        self,
+        user_id: str,
+        display_name: str,
+        data: InvoiceData,
+        image_url: str,
+        auto_match: bool = False,
+    ) -> dict:
         eligibility = self.calculate_eligibility(data)
 
         now = self.get_taiwan_time()
-        next_id_num = len(self.invoices_sheet.col_values(1))
-        inv_id = f"INV-{now.strftime('%Y%m%d')}-{str(next_id_num).zfill(3)}"
+        inv_id = self._new_invoice_id("INV", now)
 
         items_str = ", ".join([f"{item.name}" for item in data.items])
 
         matched_activity_id = ""
         reconciliation_status = 0
 
-        if eligibility in (1, 2):
+        if auto_match and eligibility in (1, 2):
             matched_activity = self._greedy_match(data.date, int(data.amount))
             if matched_activity:
                 matched_activity_id = matched_activity["activity_id"]
@@ -328,7 +399,10 @@ class SheetsService:
         self.invoices_sheet.append_row(row)
         self.log_action(
             "SAVE_INVOICE",
-            f"Saved {inv_id}. eligibility={eligibility}, matched_activity={matched_activity_id or 'NONE'}",
+            (
+                f"Saved {inv_id}. eligibility={eligibility}, auto_match={int(bool(auto_match))}, "
+                f"matched_activity={matched_activity_id or 'NONE'}"
+            ),
             user=user_id,
         )
 
@@ -349,8 +423,7 @@ class SheetsService:
         amount: int,
     ) -> dict:
         now = self.get_taiwan_time()
-        next_id_num = len(self.invoices_sheet.col_values(1))
-        inv_id = f"MAN-{now.strftime('%Y%m%d')}-{str(next_id_num).zfill(3)}"
+        inv_id = self._new_invoice_id("MAN", now)
 
         safe_receipt_type = receipt_type if receipt_type in {"空白收據", "收據", "發票", "無"} else "無"
         safe_category = category if category in {"日常開銷", "設備購置", "社課開銷", "活動開銷"} else "日常開銷"
@@ -384,6 +457,211 @@ class SheetsService:
         return {
             "invoice_id": inv_id,
             "eligibility": eligibility,
+        }
+
+    def _invoice_rows_with_index(self) -> list[dict]:
+        values = self.invoices_sheet.get_all_values()
+        if not values or len(values) <= 1:
+            return []
+
+        rows = []
+        for row_idx, row in enumerate(values[1:], start=2):
+            row_copy = list(row)
+            while len(row_copy) < 13:
+                row_copy.append("")
+            rows.append({"row_idx": row_idx, "row": row_copy})
+        return rows
+
+    def _reset_subsidy_accumulations(self) -> int:
+        values = self.subsidies_sheet.get_all_values()
+        if not values or len(values) <= 1:
+            return 0
+
+        updates = []
+        for row in values[1:]:
+            row_copy = list(row)
+            while len(row_copy) < 6:
+                row_copy.append("")
+            subsidy_amount = self._to_float(row_copy[3] if len(row_copy) > 3 else 0)
+            updates.append([0, self._calc_gap(subsidy_amount, 0.0)])
+
+        end_row = len(updates) + 1
+        self.subsidies_sheet.update(f"E2:F{end_row}", updates)
+        return len(updates)
+
+    def _clear_invoice_matching_marks(self, invoice_rows: list[dict]) -> int:
+        if not invoice_rows:
+            return 0
+        updates = [[0, ""] for _ in invoice_rows]
+        end_row = len(invoice_rows) + 1
+        self.invoices_sheet.update(f"L2:M{end_row}", updates)
+        return len(invoice_rows)
+
+    def run_invoice_matching(self, rematch: bool = False, user: str = "") -> dict:
+        invoice_rows = self._invoice_rows_with_index()
+        if not invoice_rows:
+            return {
+                "rematch": rematch,
+                "processed": 0,
+                "matched": 0,
+                "unmatched": 0,
+                "skipped": 0,
+                "subsidy_reset_rows": 0,
+                "cleared_invoice_rows": 0,
+                "unmatched_preview": [],
+            }
+
+        subsidy_reset_rows = 0
+        cleared_invoice_rows = 0
+        if rematch:
+            subsidy_reset_rows = self._reset_subsidy_accumulations()
+            cleared_invoice_rows = self._clear_invoice_matching_marks(invoice_rows)
+
+        candidates = []
+        skipped = 0
+        for entry in invoice_rows:
+            row_idx = entry["row_idx"]
+            row = entry["row"]
+            invoice_id = str(row[0]).strip()
+            invoice_date = str(row[3]).strip()
+            amount = int(self._to_float(row[5], 0.0))
+            eligibility = int(self._to_float(row[9], 0.0))
+            status = str(row[11]).strip()
+            matched_activity_id = str(row[12]).strip()
+
+            if eligibility not in (1, 2):
+                skipped += 1
+                continue
+            if amount <= 0:
+                skipped += 1
+                continue
+            parsed_date = self._parse_date(invoice_date)
+            if not parsed_date:
+                skipped += 1
+                continue
+            if not rematch and status in {"1", "TRUE", "true"} and matched_activity_id:
+                skipped += 1
+                continue
+
+            candidates.append(
+                {
+                    "row_idx": row_idx,
+                    "invoice_id": invoice_id,
+                    "invoice_date": invoice_date,
+                    "parsed_date": parsed_date,
+                    "amount": amount,
+                }
+            )
+
+        candidates.sort(key=lambda x: (x["parsed_date"], x["row_idx"]))
+
+        matched = 0
+        unmatched_ids = []
+        for candidate in candidates:
+            row_idx = candidate["row_idx"]
+            match = self._greedy_match(candidate["invoice_date"], candidate["amount"])
+            if match:
+                matched += 1
+                self._update_subsidy_amounts(
+                    row_idx=match["row_idx"],
+                    subsidy_amount=match["subsidy_amount"],
+                    current_accumulated=match["current_accumulated"],
+                    invoice_amount=candidate["amount"],
+                )
+                self.invoices_sheet.update(f"L{row_idx}:M{row_idx}", [[1, match["activity_id"]]])
+            else:
+                unmatched_ids.append(candidate["invoice_id"])
+                self.invoices_sheet.update(f"L{row_idx}:M{row_idx}", [[0, ""]])
+
+        details = (
+            f"rematch={int(bool(rematch))};processed={len(candidates)};matched={matched};"
+            f"unmatched={len(unmatched_ids)};skipped={skipped};"
+            f"subsidy_reset_rows={subsidy_reset_rows};cleared_invoice_rows={cleared_invoice_rows}"
+        )
+        self.log_action("RUN_MATCHING", details, user=user or "SYSTEM")
+        return {
+            "rematch": rematch,
+            "processed": len(candidates),
+            "matched": matched,
+            "unmatched": len(unmatched_ids),
+            "skipped": skipped,
+            "subsidy_reset_rows": subsidy_reset_rows,
+            "cleared_invoice_rows": cleared_invoice_rows,
+            "unmatched_preview": unmatched_ids[:10],
+        }
+
+    def get_subsidy_overview(self) -> list[dict]:
+        records = self.subsidies_sheet.get_all_records()
+        out = []
+        for row in records:
+            activity_id = self._normalize_activity_id(self._row_get(row, "活動ID", "活動 Id", "活動id"))
+            if not activity_id:
+                continue
+            subsidy_amount = self._to_float(self._row_get(row, "補助金額", "補助 金額") or 0)
+            current_accumulated = self._to_float(self._row_get(row, "目前累計發票", "目前 累計發票") or 0)
+            gap = self._calc_gap(subsidy_amount, current_accumulated)
+            out.append(
+                {
+                    "activity_id": activity_id,
+                    "activity_name": str(self._row_get(row, "活動名稱", "活動 名稱")).strip() or "(未命名活動)",
+                    "subsidy_amount": subsidy_amount,
+                    "current_accumulated": current_accumulated,
+                    "gap": gap,
+                    "is_enough": gap <= 0.0 and subsidy_amount > 0,
+                }
+            )
+        out.sort(key=lambda x: x["activity_id"])
+        return out
+
+    def get_activity_gap_status(self, activity_id: str) -> Optional[dict]:
+        target = self._normalize_activity_id(activity_id)
+        if not target:
+            return None
+        for item in self.get_subsidy_overview():
+            if self._normalize_activity_id(item["activity_id"]) == target:
+                return item
+        return None
+
+    def get_activity_reconciliation(self, activity_id: str, limit: int = 20) -> dict:
+        target = self._normalize_activity_id(activity_id)
+        if not target:
+            return {"found": False, "activity_id": "", "items": []}
+
+        summary = self.get_activity_gap_status(target)
+        invoice_rows = self._invoice_rows_with_index()
+        items = []
+        total_amount = 0
+        for entry in invoice_rows:
+            row = entry["row"]
+            status = str(row[11]).strip()
+            matched_activity_id = self._normalize_activity_id(row[12])
+            if status not in {"1", "TRUE", "true"}:
+                continue
+            if matched_activity_id != target:
+                continue
+            amount = int(self._to_float(row[5], 0.0))
+            total_amount += amount
+            items.append(
+                {
+                    "invoice_id": str(row[0]).strip(),
+                    "invoice_date": str(row[3]).strip(),
+                    "item_name": str(row[6]).strip(),
+                    "amount": amount,
+                    "uploader": str(row[2]).strip(),
+                }
+            )
+
+        items.sort(key=lambda x: (x["invoice_date"], x["invoice_id"]))
+        return {
+            "found": summary is not None,
+            "activity_id": target,
+            "activity_name": summary["activity_name"] if summary else "",
+            "items": items[: max(1, int(limit))],
+            "matched_invoice_count": len(items),
+            "matched_total_amount": total_amount,
+            "gap": summary["gap"] if summary else None,
+            "subsidy_amount": summary["subsidy_amount"] if summary else None,
+            "current_accumulated": summary["current_accumulated"] if summary else None,
         }
 
     def _parse_date(self, value: str) -> Optional[datetime]:

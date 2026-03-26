@@ -1,7 +1,8 @@
 ﻿import base64
 import json
+import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from openai import OpenAI
@@ -11,7 +12,9 @@ from core.schemas import InvoiceData
 
 # Initialize OpenAI client
 client = OpenAI(api_key=config.OPENAI_API_KEY)
+logger = logging.getLogger(__name__)
 _token_logger: Optional[Callable[[str, int, str], None]] = None
+_tw_timezone = timezone(timedelta(hours=8))
 
 EDITABLE_FIELDS = [
     "date",
@@ -63,7 +66,7 @@ def _emit_token_log(action: str, token: int, details: str = ""):
     try:
         _token_logger(action, max(0, _safe_int(token)), details)
     except Exception as e:
-        print(f"Error logging token usage: {e}")
+        logger.exception("Error logging token usage: %s", e)
 
 
 def _sanitize_invoice_payload(data: dict) -> dict:
@@ -79,7 +82,7 @@ def _default_consumption_category() -> str:
 
 
 def _today_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+    return datetime.now(_tw_timezone).strftime("%Y-%m-%d")
 
 
 def _normalize_manual_data(data: dict) -> dict:
@@ -160,7 +163,7 @@ def parse_manual_record_text(user_text: str, current_data: dict | None = None, t
 
     try:
         completion = client.chat.completions.create(
-            model="gpt-5-mini-2025-08-07",
+            model=config.OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": prompt},
                 {
@@ -189,7 +192,7 @@ def parse_manual_record_text(user_text: str, current_data: dict | None = None, t
         return _normalize_manual_data({**base, **data})
     except Exception as e:
         _emit_token_log("LLM_MANUAL_PARSE", 0, f"trace={trace_id or 'UNKNOWN'};status=error;error={type(e).__name__}")
-        print(f"Error parsing manual record with OpenAI: {e}")
+        logger.exception("Error parsing manual record with OpenAI: %s", e)
         return _parse_manual_record_fallback(base, user_text)
 
 
@@ -223,9 +226,16 @@ def _parse_manual_record_fallback(base: dict, user_text: str) -> dict:
     if re.fullmatch(r"\d+", text):
         updated["amount"] = int(text)
     elif any(k in text.lower() for k in ["金額", "總金額", "amount", "amt", "$", "元"]):
-        m = re.search(r"(-?\d+)", text)
+        amount_val = None
+        m = re.search(r"(?:金額|總金額|amount|amt|\$|元)\D*(-?\d+)", text, flags=re.IGNORECASE)
         if m:
-            updated["amount"] = max(0, int(m.group(1)))
+            amount_val = m.group(1)
+        else:
+            nums = re.findall(r"-?\d+", text)
+            if nums:
+                amount_val = nums[-1]
+        if amount_val is not None:
+            updated["amount"] = max(0, int(amount_val))
 
     item_patterns = [
         r"(?:消費)?品項(?:改成|改為|是|:|：)?\s*(.+)$",
@@ -377,7 +387,7 @@ def _parse_invoice_once(base64_image: str, prompt: str, extra_context: str = "")
     )
 
     completion = client.beta.chat.completions.parse(
-        model="gpt-5-mini-2025-08-07",
+        model=config.OPENAI_MODEL,
         messages=[{"role": "user", "content": content}],
         response_format=InvoiceData,
     )
@@ -439,7 +449,7 @@ def extract_invoice_data(image_bytes: bytes, trace_id: str = "") -> InvoiceData:
             total_tokens,
             f"trace={trace_id or 'UNKNOWN'};status=error;error={type(e).__name__}",
         )
-        print(f"Error processing image with OpenAI: {e}")
+        logger.exception("Error processing image with OpenAI: %s", e)
         return InvoiceData(
             date="1970-01-01",
             amount=0,
@@ -482,7 +492,7 @@ def apply_user_edit(current_data: dict, user_text: str, trace_id: str = "") -> I
 
     try:
         completion = client.beta.chat.completions.parse(
-            model="gpt-5-mini-2025-08-07",
+            model=config.OPENAI_MODEL,
             messages=[
                 {
                     "role": "system",
@@ -505,7 +515,7 @@ def apply_user_edit(current_data: dict, user_text: str, trace_id: str = "") -> I
         return InvoiceData(**normalized)
     except Exception as e:
         _emit_token_log("LLM_APPLY_EDIT", 0, f"trace={trace_id or 'UNKNOWN'};status=error;error={type(e).__name__}")
-        print(f"Error applying user edit with OpenAI: {e}")
+        logger.exception("Error applying user edit with OpenAI: %s", e)
         return _apply_user_edit_fallback(clean_current, user_text)
 
 

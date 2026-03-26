@@ -22,6 +22,12 @@
         sync: false
       - key: BUYER_TAX_ID
         value: "29902605"
+      - key: HOURLY_KEEPALIVE_ENABLED
+        value: "true"
+      - key: HOURLY_KEEPALIVE_INTERVAL_MINUTES
+        value: "10"
+      - key: HOURLY_KEEPALIVE_URL
+        value: "https://scuct-ai-linebot.onrender.com"
       - key: PUBLIC_BASE_URL
         sync: false
       - key: LIFF_ID

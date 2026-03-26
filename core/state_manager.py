@@ -1,5 +1,7 @@
 import json
 from enum import Enum
+from typing import Optional
+
 from core.schemas import UserState
 
 # Enum for states to prevent typos
@@ -22,9 +24,16 @@ class StateManager:
     def _now_iso(self) -> str:
         return self.sheets.get_taiwan_time().isoformat()
 
-    def set_state(self, line_id: str, state: AppState, temp_data: dict = None, user_name: str = None):
+    def set_state(
+        self,
+        line_id: str,
+        state: AppState,
+        temp_data: dict = None,
+        user_name: str = None,
+        current_state: Optional[UserState] = None,
+    ):
         """Save user state to Sheets"""
-        current = self.get_state(line_id)
+        current = current_state or self.get_state(line_id)
         resolved_user_name = (user_name or current.user_name or "Unknown").strip() or "Unknown"
         user_state = UserState(
             line_id=line_id,
@@ -35,13 +44,13 @@ class StateManager:
         )
         self.sheets.set_user_state(user_state)
         
-    def clear_state(self, line_id: str, user_name: str = None):
+    def clear_state(self, line_id: str, user_name: str = None, current_state: Optional[UserState] = None):
         """Reset user state to NORMAL"""
-        self.set_state(line_id, AppState.NORMAL, None, user_name=user_name)
+        self.set_state(line_id, AppState.NORMAL, None, user_name=user_name, current_state=current_state)
 
-    def touch_user(self, line_id: str, user_name: str = None):
+    def touch_user(self, line_id: str, user_name: str = None, current_state: Optional[UserState] = None):
         """Ensure user exists in States and refresh last-used timestamp."""
-        current = self.get_state(line_id)
+        current = current_state or self.get_state(line_id)
         resolved_user_name = (user_name or current.user_name or "Unknown").strip() or "Unknown"
         touched = UserState(
             line_id=line_id,

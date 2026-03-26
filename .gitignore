@@ -37,3 +37,6 @@ dist/
 # User-requested ignored folders
 archive_unused/
 tests/
+!tests/
+tests/*
+!tests/*.py
