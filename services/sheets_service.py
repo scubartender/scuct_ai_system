@@ -52,7 +52,11 @@ STATES_HEADERS_V1 = ["LINE ID", "Current State", "Temp JSON"]
 
 
 def get_gspread_client():
-    service_account_json = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
+    service_account_json = (
+        config.GOOGLE_SERVICE_ACCOUNT_JSON
+        or os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+        or ""
+    ).strip()
     if service_account_json:
         creds_dict = json.loads(service_account_json)
         credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)

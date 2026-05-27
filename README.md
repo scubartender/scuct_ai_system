@@ -29,8 +29,11 @@ Set env vars in Render:
 - LINE_CHANNEL_SECRET
 - OPENAI_API_KEY
 - OPENAI_MODEL (default: gpt-5-mini)
+- OPENAI_TIMEOUT_SECONDS (default: 45)
+- OPENAI_MAX_RETRIES (default: 2)
 - GOOGLE_SHEET_ID
 - GOOGLE_SERVICE_ACCOUNT_JSON
+- REQUIRE_RUNTIME_CONFIG (Render should use true)
 - BUYER_TAX_ID (default: 29902605)
 - DAILY_STATE_RESET_ENABLED (default: true)
 - DAILY_STATE_RESET_HOUR (default: 8, Taiwan time)
@@ -49,6 +52,8 @@ Optional:
 ## LINE Webhook
 After deploy, set webhook URL in LINE Developers:
 `https://<your-render-domain>/webhook`
+
+Render health checks use `/healthz`.
 
 ## Finance Admin Commands
 - `執行配對`: match newly eligible invoices that are currently unmatched.

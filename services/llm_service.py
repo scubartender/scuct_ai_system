@@ -10,8 +10,12 @@ from openai import OpenAI
 from config import config
 from core.schemas import InvoiceData
 
-# Initialize OpenAI client
-client = OpenAI(api_key=config.OPENAI_API_KEY)
+# Initialize OpenAI client with bounded waits so webhook work cannot hang forever.
+client = OpenAI(
+    api_key=config.OPENAI_API_KEY,
+    timeout=config.OPENAI_TIMEOUT_SECONDS,
+    max_retries=config.OPENAI_MAX_RETRIES,
+)
 logger = logging.getLogger(__name__)
 _token_logger: Optional[Callable[[str, int, str], None]] = None
 _tw_timezone = timezone(timedelta(hours=8))

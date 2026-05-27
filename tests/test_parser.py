@@ -1,4 +1,4 @@
-from core.schemas import InvoiceData, InvoiceItem
+from core.schemas import InvoiceData, InvoiceItem, ValidationResult
 from main import _extract_bookkeep_payload, _looks_like_invoice_data
 
 
@@ -51,3 +51,12 @@ def test_looks_like_invoice_data_accepts_without_items():
         consumption_category="未分類",
     )
     assert _looks_like_invoice_data(data) is True
+
+
+def test_validation_result_missing_fields_uses_independent_lists():
+    first = ValidationResult(is_valid=True, eligibility=1)
+    second = ValidationResult(is_valid=True, eligibility=1)
+
+    first.missing_fields.append("amount")
+
+    assert second.missing_fields == []

@@ -22,7 +22,7 @@ class InvoiceData(BaseModel):
 class ValidationResult(BaseModel):
     is_valid: bool
     eligibility: int
-    missing_fields: List[str] = []
+    missing_fields: List[str] = Field(default_factory=list)
 
 
 class UserState(BaseModel):

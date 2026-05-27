@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import timedelta, timezone
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
@@ -60,6 +60,7 @@ _daily_scheduler_thread = None
 _hourly_scheduler_thread = None
 _scheduler_stop_event = threading.Event()
 _debug_log_lock = threading.Lock()
+_webhook_handler_lock = threading.Lock()
 _tw_timezone = timezone(timedelta(hours=8))
 _debug_log_path = "debug_error.log"
 
@@ -67,6 +68,7 @@ _debug_log_path = "debug_error.log"
 def _build_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        config.validate_runtime_settings()
         _start_background_threads()
         try:
             yield
@@ -162,7 +164,8 @@ def _handle_event_exception(context: str, event, exc: Exception, notify_user: bo
 
 def _safe_handle_webhook(body_decoded: str, signature: str):
     try:
-        handler.handle(body_decoded, signature)
+        with _webhook_handler_lock:
+            handler.handle(body_decoded, signature)
     except InvalidSignatureError as e:
         _log_runtime_exception("webhook_background_invalid_signature", e, event=None)
     except Exception as e:
@@ -286,8 +289,13 @@ async def root():
     return {"status": "ok", "message": "Bartending Club Finance Agent is running"}
 
 
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(request: Request, background_tasks: BackgroundTasks):
     signature = request.headers.get("X-Line-Signature", "")
     if not signature:
         raise HTTPException(status_code=400, detail="Missing X-Line-Signature header")
@@ -298,12 +306,10 @@ async def webhook(request: Request):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     try:
-        handler.handle(body_decoded, signature)
+        background_tasks.add_task(_safe_handle_webhook, body_decoded, signature)
         return JSONResponse(content={"status": "ok"})
-    except InvalidSignatureError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
     except Exception as e:
-        _log_runtime_exception("webhook_handle_sync", e, event=None)
+        _log_runtime_exception("webhook_enqueue_background", e, event=None)
         raise HTTPException(status_code=500, detail="Webhook handler error")
 
 

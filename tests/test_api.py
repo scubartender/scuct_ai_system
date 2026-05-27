@@ -11,6 +11,13 @@ def test_root_endpoint():
     assert payload["status"] == "ok"
 
 
+def test_healthz_endpoint():
+    client = TestClient(main.app)
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
 def test_webhook_requires_signature():
     client = TestClient(main.app)
     response = client.post("/webhook", content="{}")

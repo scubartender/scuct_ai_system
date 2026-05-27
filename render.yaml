@@ -6,7 +6,7 @@
     autoDeploy: true
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /
+    healthCheckPath: /healthz
     envVars:
       - key: PYTHON_VERSION
         value: 3.10.13
@@ -16,10 +16,16 @@
         sync: false
       - key: OPENAI_API_KEY
         sync: false
+      - key: OPENAI_TIMEOUT_SECONDS
+        value: "45"
+      - key: OPENAI_MAX_RETRIES
+        value: "2"
       - key: GOOGLE_SHEET_ID
         sync: false
       - key: GOOGLE_SERVICE_ACCOUNT_JSON
         sync: false
+      - key: REQUIRE_RUNTIME_CONFIG
+        value: "true"
       - key: BUYER_TAX_ID
         value: "29902605"
       - key: HOURLY_KEEPALIVE_ENABLED
